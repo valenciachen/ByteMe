@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 import sqlite3
 from collections import defaultdict
@@ -12,6 +13,10 @@ OVERRIDE_RE = re.compile(r"\b(actually|ignore|instead|rather than|change of plan
 NO_PREF_RE = re.compile(
     r"(don't have(?: an? additional)? preference|no preference|use your judg(?:e)?ment|"
     r"not quite right yet|ask me about one specific attribute)",
+    re.I,
+)
+INITIAL_INTENT_RE = re.compile(
+    r"^I'm looking for (?P<category>.*?)(?:\. A key requirement is: (?P<constraint>.*)|, but I'm still exploring\.?|\. (?P<preference>.*))$",
     re.I,
 )
 
@@ -102,6 +107,35 @@ def _clean_signal(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip(" -;,.\t\n")
 
 
+def _initial_signals(user_message: str) -> tuple[str, list[str]]:
+    match = INITIAL_INTENT_RE.match(user_message.strip())
+    if not match:
+        cleaned = _clean_signal(user_message) or user_message
+        return cleaned, [cleaned] if cleaned else []
+    category = _clean_signal(match.group("category"))
+    signals: list[str] = []
+    for key in ("constraint", "preference"):
+        value = match.group(key)
+        cleaned = _clean_signal(value) if value else ""
+        if cleaned:
+            signals.append(cleaned)
+    return category or user_message, signals
+
+
+def _constraint_parts(text: str) -> list[str]:
+    cleaned = _clean_signal(text)
+    if not cleaned:
+        return []
+    parts = [cleaned]
+    lowered = cleaned.lower()
+    if "what matters is:" in lowered:
+        _, tail = cleaned.split(":", maxsplit=1)
+        parts.extend(item.strip() for item in tail.split(";"))
+    elif ";" in cleaned:
+        parts.extend(item.strip() for item in cleaned.split(";"))
+    return _dedupe([_clean_signal(part) for part in parts])
+
+
 def _fts_expression(terms: list[str], operator: str) -> str:
     return f" {operator} ".join(f'"{term}"' for term in terms) if terms else ""
 
@@ -119,6 +153,7 @@ class Agent:
     def __init__(self, catalog_path: str | Path = "data/catalog.jsonl") -> None:
         self.catalog_path = Path(catalog_path)
         self.connection = sqlite3.connect(":memory:")
+        self._documents: dict[str, str] = {}
         self._sessions: dict[str, dict] = {}
         self._build_index()
 
@@ -133,11 +168,18 @@ class Agent:
         with self.catalog_path.open(encoding="utf-8") as handle:
             for line in handle:
                 product = json.loads(line)
-                batch.append((
-                    str(product["parent_asin"]), _text(product.get("title")),
-                    _text(product.get("categories")), _text(product.get("features")),
-                    _text(product.get("details")), _text(product.get("store")),
+                parent_asin = str(product["parent_asin"])
+                fields = (
+                    _text(product.get("title")),
+                    _text(product.get("categories")),
+                    _text(product.get("features")),
+                    _text(product.get("details")),
+                    _text(product.get("store")),
                     _text(product.get("description")),
+                )
+                self._documents[parent_asin] = " ".join(fields).lower()
+                batch.append((
+                    parent_asin, *fields,
                 ))
                 if len(batch) >= 1000:
                     cursor.executemany("INSERT INTO products VALUES (?, ?, ?, ?, ?, ?, ?)", batch)
@@ -170,11 +212,9 @@ class Agent:
         return [str(row[0]) for row in rows]
 
     def _add_signal(self, session: dict, text: str) -> None:
-        cleaned = _clean_signal(text)
-        if not cleaned:
-            return
-        session["evidence"].append(cleaned)
-        session["observed_attrs"].add(_attribute_in(cleaned))
+        for cleaned in _constraint_parts(text):
+            session["evidence"].append(cleaned)
+            session["observed_attrs"].add(_attribute_in(cleaned))
 
     def _query_terms(self, session: dict) -> list[str]:
         return _dedupe(_terms(" ".join([
@@ -228,8 +268,22 @@ class Agent:
         for weight, expression in self._query_plan(session):
             for rank, parent_asin in enumerate(self._search(expression), start=1):
                 fused[parent_asin] += weight / (30 + rank)
-        ordered = sorted(fused, key=lambda asin: (-fused[asin], asin))[:top_k]
-        return [{"parent_asin": asin, "score": round(fused[asin], 8)} for asin in ordered]
+        evidence = [text.lower() for text in session["evidence"][-5:] if len(_terms(text)) >= 2]
+        query_terms = set(self._query_terms(session))
+
+        def score(parent_asin: str) -> float:
+            value = fused[parent_asin]
+            document = self._documents.get(parent_asin, "")
+            for phrase in evidence:
+                if phrase and phrase in document:
+                    value += 0.06
+            if query_terms:
+                overlap = len(query_terms.intersection(_terms(document)))
+                value += 0.012 * overlap / math.sqrt(len(query_terms))
+            return value
+
+        ordered = sorted(fused, key=lambda asin: (-score(asin), asin))[:top_k]
+        return [{"parent_asin": asin, "score": round(score(asin), 8)} for asin in ordered]
 
     def _next_question(self, session: dict) -> str | None:
         asked = set(session["asked"])
@@ -269,14 +323,14 @@ class Agent:
             session["asked"].append(previous_question)
 
         if not session["category_context"]:
-            session["category_context"] = _clean_signal(user_message) or user_message
+            category_context, signals = _initial_signals(user_message)
+            session["category_context"] = category_context
             session["category_terms"] = _terms(session["category_context"])
+            for signal in signals:
+                self._add_signal(session, signal)
         else:
             if NO_PREF_RE.search(user_message) and previous_question:
                 session["negative_attrs"].add(previous_question)
-            if OVERRIDE_RE.search(user_message):
-                session["evidence"] = []
-                session["observed_attrs"] = set()
             self._add_signal(session, user_message)
 
         recommendations = self._recommend(session, min(top_k, 10))
