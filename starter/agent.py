@@ -5,6 +5,7 @@ import math
 import re
 import sqlite3
 from collections import defaultdict
+from functools import lru_cache
 from pathlib import Path
 
 
@@ -112,6 +113,7 @@ def _text(value: object) -> str:
     return str(value)
 
 
+@lru_cache(maxsize=200_000)
 def _terms(text: str) -> list[str]:
     normalized = canonicalize_text(text)
     terms = []
@@ -225,6 +227,8 @@ class Agent:
         self.connection = sqlite3.connect(":memory:")
         self._catalog: dict[str, dict] = {}
         self._documents: dict[str, str] = {}
+        self._field_cache: dict[tuple[int, tuple[str, ...]], str] = {}
+        self._product_doc_cache: dict[int, str] = {}
         self._sessions: dict[str, dict] = {}
         self._build_index()
 
@@ -289,6 +293,48 @@ class Agent:
         ).fetchall()
         return [str(row[0]) for row in rows]
 
+    def _field_text(self, product: dict, fields: tuple[str, ...]) -> str:
+        key = (id(product), fields)
+        if key not in self._field_cache:
+            self._field_cache[key] = canonicalize_text(_text([product.get(field) for field in fields]))
+        return self._field_cache[key]
+
+    def _overlap(self, terms: list[str], text: str) -> float:
+        if not terms or not text:
+            return 0.0
+        words = set(_terms(text))
+        return sum(term in words for term in terms) / len(set(terms))
+
+    def _signal_score(self, signal: str, product: dict, weight: float = 1.0) -> float:
+        """Score a conversational signal by field and by complete phrase coverage.
+
+        FTS is intentionally only used for high-recall retrieval.  This second
+        stage rewards a product that matches the whole signal, especially in
+        its title/features, instead of one that happens to share a popular
+        token with it.
+        """
+        normalized = canonicalize_text(signal)
+        terms = _terms(normalized)
+        if not terms:
+            return 0.0
+        title = self._field_text(product, ("title",))
+        descriptive = self._field_text(product, ("features", "details", "description"))
+        categories = self._field_text(product, ("categories",))
+        title_overlap = self._overlap(terms, title)
+        descriptive_overlap = self._overlap(terms, descriptive)
+        category_overlap = self._overlap(terms, categories)
+        score = weight * (34.0 * title_overlap + 20.0 * descriptive_overlap + 10.0 * category_overlap)
+        if normalized in title:
+            score += weight * 42.0
+        elif normalized in descriptive:
+            score += weight * 24.0
+        # A near-complete phrase match is a useful precision signal even when
+        # punctuation or a catalog field boundary prevents exact containment.
+        coverage = max(title_overlap, descriptive_overlap, category_overlap)
+        if len(terms) > 1 and coverage >= 0.75:
+            score += weight * 18.0 * coverage
+        return score
+
     def _merge_constraint(self, session: dict, attr: str, value: str) -> None:
         if not attr or not value:
             return
@@ -325,6 +371,8 @@ class Agent:
                 session["observed_attrs"].add(attr)
             if OVERRIDE_RE.search(cleaned):
                 session["constraints"].clear()
+                session["evidence"] = [cleaned]
+                session["observed_attrs"].clear()
             for key, value in self._extract_structured_constraints(cleaned).items():
                 self._merge_constraint(session, key, value)
 
@@ -369,6 +417,9 @@ class Agent:
     def _product_doc(self, product: dict) -> str:
         if not product:
             return ""
+        cache_key = id(product)
+        if cache_key in self._product_doc_cache:
+            return self._product_doc_cache[cache_key]
         fields = [
             product.get("title"),
             product.get("categories"),
@@ -380,7 +431,8 @@ class Agent:
             f"rating {product.get('average_rating')}",
             f"reviews {product.get('rating_number')}",
         ]
-        return canonicalize_text(_text(fields))
+        self._product_doc_cache[cache_key] = canonicalize_text(_text(fields))
+        return self._product_doc_cache[cache_key]
 
     def _attribute_score(self, value: str, product: dict) -> float:
         if not value:
@@ -419,17 +471,26 @@ class Agent:
                         mid = (lo + hi) / 2.0
                         score += max(0.0, 18.0 - abs(price_value - mid) / 10.0)
                 else:
+                    # Structured constraints are precision signals.  Keep
+                    # them broad enough for retrieval, but score exact
+                    # attribute matches much more strongly in reranking.
                     score += self._attribute_score(value, product)
 
-        for term in self._category_terms(session):
+        category_terms = self._category_terms(session)
+        for term in category_terms:
             if term in doc:
                 score += 16.0
         for term in session["profile_terms"]:
             if term in doc:
                 score += 6.0
-        for expr in session["evidence"]:
-            if expr and canonicalize_text(expr) in doc:
-                score += 10.0
+        evidence = session["evidence"]
+        for index, signal in enumerate(evidence):
+            # Recent turns represent the current intent more reliably than
+            # the initial exploratory wording.
+            recency = 1.0 + 0.45 * (index / max(1, len(evidence) - 1))
+            # Bounded precision bonus: the established score remains the
+            # recall-safe anchor, while phrase/field agreement breaks ties.
+            score += self._signal_score(signal, product, recency * 0.35)
 
         title = canonicalize_text(product.get("title") or "")
         if title and any(term in title for term in self._category_terms(session)):
@@ -450,7 +511,8 @@ class Agent:
     def _recommend(self, session: dict, top_k: int) -> list[dict]:
         fused: defaultdict[str, float] = defaultdict(float)
         for weight, expression in self._query_plan(session):
-            for rank, asin in enumerate(self._search(expression, limit=200), start=1):
+            # Keep retrieval high-recall; precision belongs in the reranker.
+            for rank, asin in enumerate(self._search(expression, limit=400), start=1):
                 fused[asin] += weight / (rank + 4.0)
 
         if not fused:
