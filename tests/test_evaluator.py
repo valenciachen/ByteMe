@@ -6,6 +6,7 @@ import json
 import tempfile
 
 from evaluator.local_evaluator import catalog_index, evaluate, metric_summary, normalize_recommendations
+from starter.agent import canonicalize_text, parse_budget_hint
 
 
 class EchoTargetAgent:
@@ -38,6 +39,15 @@ class EvaluatorTest(unittest.TestCase):
             "mrr": .25,
             "mttc": 6.5,
         })
+
+    def test_budget_and_synonym_utils(self) -> None:
+        self.assertEqual(parse_budget_hint("under $50"), (0.0, 50.0))
+        self.assertEqual(parse_budget_hint("budget of 40 dollars"), (0.0, 40.0))
+        self.assertEqual(parse_budget_hint("around $30"), (24.0, 36.0))
+        normalized = canonicalize_text("grey jacket sneakers")
+        self.assertIn("gray", normalized)
+        self.assertIn("jacket", normalized)
+        self.assertIn("sneaker", normalized)
 
     def test_evaluate_derives_hidden_fields_when_public_set_omits_them(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
